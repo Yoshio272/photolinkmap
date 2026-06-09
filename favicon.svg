@@ -1,0 +1,141 @@
+/**
+ * image-proxy.ts
+ * 360度画像のCORSプロキシ
+ *
+ * 対応:
+ *   Google Drive: ?url=encodeURIComponent(lh3URL)
+ *   Box:          ?provider=box&fileId=xxx&token=xxx
+ */
+import type { Handler } from '@netlify/functions'
+
+const ALLOWED_DOMAINS = [
+  'lh3.googleusercontent.com',
+  'dl.boxcloud.com',
+  'api.box.com',
+  'storage.googleapis.com',
+]
+
+export const handler: Handler = async (event) => {
+  const headers = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+  }
+
+  if (event.httpMethod === 'OPTIONS') {
+    return { statusCode: 204, headers, body: '' }
+  }
+
+  const params = event.queryStringParameters ?? {}
+
+  // ===== Box: トークン認証でファイルダウンロード =====
+  if (params.provider === 'box' && params.fileId && params.token) {
+    try {
+      const fileId = params.fileId
+      const token  = params.token
+
+      // Box Content API でファイルダウンロード
+      const res = await fetch(`https://api.box.com/2.0/files/${fileId}/content`, {
+        headers: { 'Authorization': `Bearer ${token}` },
+        redirect: 'follow',
+      })
+
+      if (!res.ok) {
+        const msg = res.status === 401 ? 'Box認証が無効です。再サインインしてください。'
+                  : res.status === 403 ? 'Boxファイルへのアクセス権限がありません。'
+                  : res.status === 404 ? 'BoxファイルID が見つかりません。'
+                  : `Box API エラー: ${res.status}`
+        return {
+          statusCode: res.status,
+          headers: { ...headers, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ error: msg }),
+        }
+      }
+
+      const contentType = res.headers.get('content-type') ?? 'image/jpeg'
+      const buffer = await res.arrayBuffer()
+      const base64 = Buffer.from(buffer).toString('base64')
+
+      console.log(`[image-proxy] Box file ${fileId}: ${contentType}, ${buffer.byteLength} bytes`)
+
+      return {
+        statusCode: 200,
+        headers: { ...headers, 'Content-Type': contentType, 'Cache-Control': 'private, max-age=3600' },
+        body: base64,
+        isBase64Encoded: true,
+      }
+    } catch (err) {
+      console.error('[image-proxy] Box error:', err)
+      return {
+        statusCode: 502,
+        headers,
+        body: 'Box画像の取得に失敗しました',
+      }
+    }
+  }
+
+  // ===== Google Drive / その他: URL経由プロキシ =====
+  const rawUrl = params.url
+  if (!rawUrl) {
+    return {
+      statusCode: 400,
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ error: 'url or (provider+fileId+token) parameter required' }),
+    }
+  }
+
+  let targetUrl: string
+  try {
+    targetUrl = decodeURIComponent(rawUrl)
+    const u = new URL(targetUrl)
+    if (!ALLOWED_DOMAINS.some(d => u.hostname.endsWith(d))) {
+      return {
+        statusCode: 403,
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ error: `Domain not allowed: ${u.hostname}` }),
+      }
+    }
+  } catch {
+    return {
+      statusCode: 400,
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ error: 'Invalid URL' }),
+    }
+  }
+
+  try {
+    const res = await fetch(targetUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; PhotoLinkMap/1.0)' },
+      redirect: 'follow',
+    })
+
+    if (!res.ok) {
+      return { statusCode: res.status, headers, body: `Upstream error: ${res.status}` }
+    }
+
+    const contentType = res.headers.get('content-type') ?? 'image/jpeg'
+    // HTMLが返ってきた場合はエラー（Drive認証ページ等）
+    if (contentType.includes('text/html')) {
+      return {
+        statusCode: 403,
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ error: 'HTMLが返されました。Driveの共有設定を「リンクを知っている全員が閲覧可能」に変更してください。' }),
+      }
+    }
+
+    const buffer = await res.arrayBuffer()
+    const base64 = Buffer.from(buffer).toString('base64')
+
+    console.log(`[image-proxy] ${targetUrl.slice(0, 60)}: ${contentType}, ${buffer.byteLength} bytes`)
+
+    return {
+      statusCode: 200,
+      headers: { ...headers, 'Content-Type': contentType, 'Cache-Control': 'public, max-age=3600' },
+      body: base64,
+      isBase64Encoded: true,
+    }
+  } catch (err) {
+    console.error('[image-proxy] error:', err)
+    return { statusCode: 502, headers, body: 'Failed to fetch image' }
+  }
+}
